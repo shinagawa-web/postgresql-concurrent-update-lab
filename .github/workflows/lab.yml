@@ -1,0 +1,11 @@
+name: lab
+
+on:
+  pull_request:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: chmod +x run_all.sh && ./run_all.sh
