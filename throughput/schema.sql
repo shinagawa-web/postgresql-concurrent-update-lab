@@ -1,9 +1,13 @@
-CREATE TABLE IF NOT EXISTS items (
-  id    integer PRIMARY KEY,
-  stock integer NOT NULL
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS items;
+
+CREATE TABLE items (
+  id      integer PRIMARY KEY,
+  stock   integer NOT NULL,
+  version bigint  NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS orders (
+CREATE TABLE orders (
   id         bigserial PRIMARY KEY,
   item_id    integer NOT NULL,
   worker     bigint NOT NULL,

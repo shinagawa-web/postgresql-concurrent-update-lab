@@ -3,9 +3,8 @@
 Measure throughput ceiling for SELECT ... FOR UPDATE vs alternatives.
 
 Patterns:
-  sfu: SELECT ... FOR UPDATE, sleep(hold), UPDATE
-  ol:  SELECT (no lock), sleep(hold), UPDATE WHERE stock = old (optimistic, retry on conflict)
-  du:  UPDATE SET stock = stock - 1 WHERE stock > 0 (no hold)
+  for_update:  SELECT ... FOR UPDATE, sleep(hold), UPDATE
+  conditional: UPDATE SET stock = stock - 1 WHERE stock > 0 (no separate SELECT, no hold)
 """
 import argparse
 import os
@@ -26,11 +25,11 @@ def init_db(init_stock):
     with psycopg.connect(DSN) as conn:
         with conn.cursor() as cur:
             cur.execute("TRUNCATE items, orders RESTART IDENTITY")
-            cur.execute("INSERT INTO items (id, stock) VALUES (1, %s)", (init_stock,))
+            cur.execute("INSERT INTO items (id, stock, version) VALUES (1, %s, 0)", (init_stock,))
         conn.commit()
 
 
-def worker_sfu(latencies, hold_sec):
+def worker_for_update(latencies, hold_sec):
     t0 = time.monotonic()
     with psycopg.connect(DSN) as conn:
         with conn.cursor() as cur:
@@ -51,23 +50,25 @@ def worker_sfu(latencies, hold_sec):
     latencies.append(time.monotonic() - t0)
 
 
-def worker_ol(latencies, hold_sec):
+
+def worker_conditional(latencies, hold_sec):
     while True:
         t0 = time.monotonic()
         with psycopg.connect(DSN) as conn:
             with conn.cursor() as cur:
                 cur.execute("BEGIN")
-                cur.execute("SELECT stock FROM items WHERE id = 1")
-                stock = cur.fetchone()[0]
+                cur.execute("SELECT stock, version FROM items WHERE id = 1")
+                stock, version = cur.fetchone()
                 if stock <= 0:
                     conn.commit()
                     latencies.append(time.monotonic() - t0)
                     return
-                if hold_sec > 0:
-                    cur.execute("SELECT pg_sleep(%s)", (hold_sec,))
                 cur.execute(
-                    "UPDATE items SET stock = %s WHERE id = 1 AND stock = %s",
-                    (stock - 1, stock),
+                    """UPDATE items
+                          SET stock   = stock - 1,
+                              version = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                        WHERE id = 1 AND version = %s AND stock > 0""",
+                    (version,),
                 )
                 if cur.rowcount == 0:
                     conn.rollback()
@@ -81,25 +82,10 @@ def worker_ol(latencies, hold_sec):
         return
 
 
-def worker_du(latencies, hold_sec):
-    t0 = time.monotonic()
-    with psycopg.connect(DSN) as conn:
-        with conn.cursor() as cur:
-            cur.execute("BEGIN")
-            cur.execute("UPDATE items SET stock = stock - 1 WHERE id = 1 AND stock > 0")
-            if cur.rowcount == 0:
-                conn.commit()
-                latencies.append(time.monotonic() - t0)
-                return
-            cur.execute(
-                "INSERT INTO orders (item_id, worker) VALUES (1, %s)",
-                (threading.get_ident() % 10 ** 9,),
-            )
-            conn.commit()
-    latencies.append(time.monotonic() - t0)
-
-
-PATTERNS = {"sfu": worker_sfu, "ol": worker_ol, "du": worker_du}
+PATTERNS = {
+    "for_update": worker_for_update,
+    "conditional": worker_conditional,
+}
 
 
 def run_once(pattern, concurrency, hold_sec, init_stock):
@@ -135,7 +121,7 @@ def run_once(pattern, concurrency, hold_sec, init_stock):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--pattern", required=True, choices=["sfu", "ol", "du"])
+    p.add_argument("--pattern", required=True, choices=["for_update", "conditional"])
     p.add_argument("--concurrency", type=int, default=10)
     p.add_argument("--hold", type=float, default=0.0, help="seconds between read and write")
     p.add_argument("--init-stock", type=int, default=500)
