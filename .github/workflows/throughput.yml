@@ -1,18 +1,16 @@
-name: lab
+name: throughput
 
 on:
   pull_request:
     paths:
-      - 'run.py'
-      - 'run_all.sh'
-      - 'schema.sql'
+      - 'throughput/**'
       - 'Dockerfile'
       - 'docker-compose.yml'
-      - '.github/workflows/lab.yml'
+      - '.github/workflows/throughput.yml'
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: chmod +x run_all.sh && ./run_all.sh
+      - run: chmod +x throughput/run_all.sh && ./throughput/run_all.sh
