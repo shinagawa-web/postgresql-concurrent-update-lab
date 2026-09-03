@@ -3,7 +3,7 @@ set -e
 
 docker compose up -d
 docker compose exec -T postgres sh -c 'until pg_isready -U postgres; do sleep 1; done'
-docker compose exec -T postgres psql -U postgres -d lab -f /dev/stdin < schema.sql
+docker compose exec -T postgres psql -U postgres -d lab -f /dev/stdin < lost-update/schema.sql
 
 run() {
   echo "=== $* ==="

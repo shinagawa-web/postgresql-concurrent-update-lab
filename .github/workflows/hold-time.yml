@@ -1,4 +1,4 @@
-name: throughput
+name: hold-time
 
 on:
   pull_request:
