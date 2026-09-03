@@ -3,9 +3,7 @@ name: lab
 on:
   pull_request:
     paths:
-      - 'run.py'
-      - 'run_all.sh'
-      - 'schema.sql'
+      - 'lost-update/**'
       - 'Dockerfile'
       - 'docker-compose.yml'
       - '.github/workflows/lab.yml'
@@ -15,4 +13,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: chmod +x run_all.sh && ./run_all.sh
+      - run: chmod +x lost-update/run_all.sh && ./lost-update/run_all.sh

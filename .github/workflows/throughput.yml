@@ -3,7 +3,7 @@ name: throughput
 on:
   pull_request:
     paths:
-      - 'throughput/**'
+      - 'hold-time/**'
       - 'Dockerfile'
       - 'docker-compose.yml'
       - '.github/workflows/throughput.yml'
@@ -13,4 +13,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: chmod +x throughput/run_all.sh && ./throughput/run_all.sh
+      - run: chmod +x hold-time/run_all.sh && ./hold-time/run_all.sh

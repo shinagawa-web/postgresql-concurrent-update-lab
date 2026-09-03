@@ -29,7 +29,7 @@ services:
 
   throughput-runner:
     build: .
-    entrypoint: ["python3", "/app/throughput/run.py"]
+    entrypoint: ["python3", "/app/hold-time/run.py"]
     environment:
       PGHOST: postgres
       PGPORT: 5432

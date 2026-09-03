@@ -2,7 +2,7 @@
 set -e
 
 docker compose up -d --wait
-docker compose exec -T postgres psql -U postgres -d lab -f /dev/stdin < throughput/schema.sql
+docker compose exec -T postgres psql -U postgres -d lab -f /dev/stdin < hold-time/schema.sql
 
 run() {
   echo "=== $* ==="
@@ -17,7 +17,7 @@ done
 
 # Round 2: concurrency sweep at hold=0.1 — ceiling should not move
 for conc in 1 5 10 20 50; do
-  run --pattern for_update --concurrency "$conc" --hold 0.1 --init-stock 500 --runs 2
+  run --pattern for_update --concurrency "$conc" --hold 0.1 --init-stock 500 --runs 2 --observe
 done
 
 # Round 3: pattern comparison at concurrency=20
