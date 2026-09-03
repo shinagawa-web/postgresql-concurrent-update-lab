@@ -88,7 +88,20 @@ PATTERNS = {
 }
 
 
-def run_once(pattern, concurrency, hold_sec, init_stock):
+def _observe(stop_event):
+    with psycopg.connect(DSN) as conn:
+        conn.autocommit = True
+        while not stop_event.wait(0.5):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE wait_event_type = 'Lock' AND state = 'active'"
+                )
+                n = cur.fetchone()[0]
+                print(f"  lock_waiters={n}", flush=True)
+
+
+def run_once(pattern, concurrency, hold_sec, init_stock, observe=False):
     fn = PATTERNS[pattern]
     latencies = []
     lock = threading.Lock()
@@ -100,6 +113,10 @@ def run_once(pattern, concurrency, hold_sec, init_stock):
             latencies.extend(local)
 
     init_db(init_stock)
+    stop = threading.Event()
+    if observe:
+        threading.Thread(target=_observe, args=(stop,), daemon=True).start()
+
     threads = [threading.Thread(target=wrapper) for _ in range(concurrency)]
     t_start = time.monotonic()
     for t in threads:
@@ -107,6 +124,7 @@ def run_once(pattern, concurrency, hold_sec, init_stock):
     for t in threads:
         t.join()
     elapsed = time.monotonic() - t_start
+    stop.set()
 
     if not latencies:
         return {"tps": 0.0, "p50_ms": 0.0, "p99_ms": 0.0, "elapsed_s": elapsed, "count": 0}
@@ -126,6 +144,7 @@ def main():
     p.add_argument("--hold", type=float, default=0.0, help="seconds between read and write")
     p.add_argument("--init-stock", type=int, default=500)
     p.add_argument("--runs", type=int, default=1)
+    p.add_argument("--observe", action="store_true", help="sample lock waiters during run")
     args = p.parse_args()
 
     print(
@@ -134,7 +153,7 @@ def main():
     )
     print(f"{'run':>4}  {'tps':>8} {'p50_ms':>8} {'p99_ms':>9} {'count':>6} {'elapsed_s':>10}")
     for r in range(1, args.runs + 1):
-        res = run_once(args.pattern, args.concurrency, args.hold, args.init_stock)
+        res = run_once(args.pattern, args.concurrency, args.hold, args.init_stock, args.observe)
         print(
             f"{r:>4}  {res['tps']:>8.2f} {res['p50_ms']:>8.1f} "
             f"{res['p99_ms']:>9.1f} {res['count']:>6} {res['elapsed_s']:>10.3f}"

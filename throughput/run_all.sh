@@ -11,7 +11,7 @@ run() {
 
 # Round 1: hold time sweep, concurrency fixed at 20
 # Theoretical ceiling: TPS = 1/hold
-for hold in 0.01 0.1 0.5; do
+for hold in 0.01 0.1 1.0 5.0; do
   run --pattern for_update --concurrency 20 --hold "$hold" --init-stock 500 --runs 2
 done
 
