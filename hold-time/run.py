@@ -25,7 +25,7 @@ def init_db(init_stock):
     with psycopg.connect(DSN) as conn:
         with conn.cursor() as cur:
             cur.execute("TRUNCATE items, orders RESTART IDENTITY")
-            cur.execute("INSERT INTO items (id, stock, version) VALUES (1, %s, 0)", (init_stock,))
+            cur.execute("INSERT INTO items (id, stock) VALUES (1, %s)", (init_stock,))
         conn.commit()
 
 
@@ -52,34 +52,23 @@ def worker_for_update(latencies, hold_sec):
 
 
 def worker_conditional(latencies, hold_sec):
-    while True:
-        t0 = time.monotonic()
-        with psycopg.connect(DSN) as conn:
-            with conn.cursor() as cur:
-                cur.execute("BEGIN")
-                cur.execute("SELECT stock, version FROM items WHERE id = 1")
-                stock, version = cur.fetchone()
-                if stock <= 0:
-                    conn.commit()
-                    latencies.append(time.monotonic() - t0)
-                    return
-                cur.execute(
-                    """UPDATE items
-                          SET stock   = stock - 1,
-                              version = (extract(epoch from clock_timestamp()) * 1000)::bigint
-                        WHERE id = 1 AND version = %s AND stock > 0""",
-                    (version,),
-                )
-                if cur.rowcount == 0:
-                    conn.rollback()
-                    continue
-                cur.execute(
-                    "INSERT INTO orders (item_id, worker) VALUES (1, %s)",
-                    (threading.get_ident() % 10 ** 9,),
-                )
+    t0 = time.monotonic()
+    with psycopg.connect(DSN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("BEGIN")
+            cur.execute(
+                "UPDATE items SET stock = stock - 1 WHERE id = 1 AND stock > 0"
+            )
+            if cur.rowcount == 0:
                 conn.commit()
-        latencies.append(time.monotonic() - t0)
-        return
+                latencies.append(time.monotonic() - t0)
+                return
+            cur.execute(
+                "INSERT INTO orders (item_id, worker) VALUES (1, %s)",
+                (threading.get_ident() % 10 ** 9,),
+            )
+            conn.commit()
+    latencies.append(time.monotonic() - t0)
 
 
 PATTERNS = {
