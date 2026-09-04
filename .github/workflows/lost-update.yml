@@ -1,4 +1,4 @@
-name: lab
+name: lost-update
 
 on:
   pull_request:
@@ -6,7 +6,7 @@ on:
       - 'lost-update/**'
       - 'Dockerfile'
       - 'docker-compose.yml'
-      - '.github/workflows/lab.yml'
+      - '.github/workflows/lost-update.yml'
 
 jobs:
   run:
