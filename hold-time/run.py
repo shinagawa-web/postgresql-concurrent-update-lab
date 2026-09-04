@@ -10,6 +10,7 @@ import argparse
 import os
 import threading
 import time
+import psutil
 import psycopg
 
 DSN = (
@@ -78,6 +79,7 @@ PATTERNS = {
 
 
 def _observe(stop_event):
+    psutil.cpu_percent()
     with psycopg.connect(DSN) as conn:
         conn.autocommit = True
         while not stop_event.wait(0.5):
@@ -87,7 +89,8 @@ def _observe(stop_event):
                     "WHERE wait_event_type = 'Lock' AND state = 'active'"
                 )
                 n = cur.fetchone()[0]
-                print(f"  lock_waiters={n}", flush=True)
+                cpu = psutil.cpu_percent()
+                print(f"  lock_waiters={n} cpu_pct={cpu:.1f}", flush=True)
 
 
 def run_once(pattern, concurrency, hold_sec, init_stock, observe=False):
