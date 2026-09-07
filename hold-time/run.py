@@ -4,7 +4,10 @@ Measure throughput ceiling for SELECT ... FOR UPDATE vs alternatives.
 
 Patterns:
   for_update:  SELECT ... FOR UPDATE, sleep(hold), UPDATE
-  conditional: UPDATE SET stock = stock - 1 WHERE stock > 0 (no separate SELECT, no hold)
+  conditional: UPDATE SET stock = stock - 1 WHERE stock > 0
+
+Each worker loops for the duration of the measurement window (stop_event driven),
+so TPS emerges from system behavior rather than being defined by thread count x hold.
 """
 import argparse
 import os
@@ -30,46 +33,58 @@ def init_db(init_stock):
         conn.commit()
 
 
-def worker_for_update(latencies, hold_sec):
-    t0 = time.monotonic()
+def worker_for_update(latencies, stop_event, hold_sec):
     with psycopg.connect(DSN) as conn:
-        with conn.cursor() as cur:
-            cur.execute("BEGIN")
-            cur.execute("SELECT stock FROM items WHERE id = 1 FOR UPDATE")
-            stock = cur.fetchone()[0]
-            if stock <= 0:
-                conn.commit()
-                return
-            if hold_sec > 0:
-                cur.execute("SELECT pg_sleep(%s)", (hold_sec,))
-            cur.execute("UPDATE items SET stock = stock - 1 WHERE id = 1")
-            cur.execute(
-                "INSERT INTO orders (item_id, worker) VALUES (1, %s)",
-                (threading.get_ident() % 10 ** 9,),
-            )
-            conn.commit()
-    latencies.append(time.monotonic() - t0)
-
-
-
-def worker_conditional(latencies, hold_sec):
-    t0 = time.monotonic()
-    with psycopg.connect(DSN) as conn:
-        with conn.cursor() as cur:
-            cur.execute("BEGIN")
-            cur.execute(
-                "UPDATE items SET stock = stock - 1 WHERE id = 1 AND stock > 0"
-            )
-            if cur.rowcount == 0:
-                conn.commit()
+        while not stop_event.is_set():
+            t0 = time.monotonic()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("BEGIN")
+                    cur.execute("SELECT stock FROM items WHERE id = 1 FOR UPDATE")
+                    stock = cur.fetchone()[0]
+                    if stock <= 0:
+                        conn.commit()
+                        return
+                    if hold_sec > 0:
+                        cur.execute("SELECT pg_sleep(%s)", (hold_sec,))
+                    cur.execute("UPDATE items SET stock = stock - 1 WHERE id = 1")
+                    cur.execute(
+                        "INSERT INTO orders (item_id, worker) VALUES (1, %s)",
+                        (threading.get_ident() % 10 ** 9,),
+                    )
+                    conn.commit()
                 latencies.append(time.monotonic() - t0)
-                return
-            cur.execute(
-                "INSERT INTO orders (item_id, worker) VALUES (1, %s)",
-                (threading.get_ident() % 10 ** 9,),
-            )
-            conn.commit()
-    latencies.append(time.monotonic() - t0)
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+
+def worker_conditional(latencies, stop_event, hold_sec):
+    with psycopg.connect(DSN) as conn:
+        while not stop_event.is_set():
+            t0 = time.monotonic()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("BEGIN")
+                    cur.execute(
+                        "UPDATE items SET stock = stock - 1 WHERE id = 1 AND stock > 0"
+                    )
+                    if cur.rowcount == 0:
+                        conn.commit()
+                        return
+                    cur.execute(
+                        "INSERT INTO orders (item_id, worker) VALUES (1, %s)",
+                        (threading.get_ident() % 10 ** 9,),
+                    )
+                    conn.commit()
+                latencies.append(time.monotonic() - t0)
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
 
 
 PATTERNS = {
@@ -93,40 +108,46 @@ def _observe(stop_event):
                 print(f"  lock_waiters={n} cpu_pct={cpu:.1f}", flush=True)
 
 
-def run_once(pattern, concurrency, hold_sec, init_stock, observe=False):
+def run_once(pattern, concurrency, hold_sec, duration_sec, init_stock, observe=False):
     fn = PATTERNS[pattern]
     latencies = []
     lock = threading.Lock()
+    stop = threading.Event()
 
     def wrapper():
         local = []
-        fn(local, hold_sec)
+        fn(local, stop, hold_sec)
         with lock:
             latencies.extend(local)
 
     init_db(init_stock)
-    stop = threading.Event()
+
+    obs_stop = threading.Event()
     if observe:
-        threading.Thread(target=_observe, args=(stop,), daemon=True).start()
+        threading.Thread(target=_observe, args=(obs_stop,), daemon=True).start()
 
     threads = [threading.Thread(target=wrapper) for _ in range(concurrency)]
     t_start = time.monotonic()
     for t in threads:
         t.start()
-    for t in threads:
-        t.join()
-    elapsed = time.monotonic() - t_start
+
+    time.sleep(duration_sec)
     stop.set()
 
+    for t in threads:
+        t.join()
+
+    obs_stop.set()
+    elapsed = time.monotonic() - t_start
+
     if not latencies:
-        return {"tps": 0.0, "p50_ms": 0.0, "p99_ms": 0.0, "elapsed_s": elapsed, "count": 0}
+        return {"tps": 0.0, "p99_ms": 0.0, "elapsed_s": elapsed, "count": 0}
 
     latencies.sort()
     n = len(latencies)
-    p50 = latencies[n // 2] * 1000
     p99 = latencies[min(int(n * 0.99), n - 1)] * 1000
     tps = n / elapsed
-    return {"tps": tps, "p50_ms": p50, "p99_ms": p99, "elapsed_s": elapsed, "count": n}
+    return {"tps": tps, "p99_ms": p99, "elapsed_s": elapsed, "count": n}
 
 
 def main():
@@ -134,6 +155,7 @@ def main():
     p.add_argument("--pattern", required=True, choices=["for_update", "conditional"])
     p.add_argument("--concurrency", type=int, default=10)
     p.add_argument("--hold", type=float, default=0.0, help="seconds between read and write")
+    p.add_argument("--duration", type=int, default=30, help="measurement window in seconds")
     p.add_argument("--init-stock", type=int, default=500)
     p.add_argument("--runs", type=int, default=1)
     p.add_argument("--observe", action="store_true", help="sample lock waiters during run")
@@ -141,13 +163,16 @@ def main():
 
     print(
         f"pattern={args.pattern} concurrency={args.concurrency} "
-        f"hold={args.hold}s init_stock={args.init_stock}"
+        f"hold={args.hold}s duration={args.duration}s init_stock={args.init_stock}"
     )
-    print(f"{'run':>4}  {'tps':>8} {'p50_ms':>8} {'p99_ms':>9} {'count':>6} {'elapsed_s':>10}")
+    print(f"{'run':>4}  {'tps':>8} {'p99_ms':>9} {'count':>6} {'elapsed_s':>10}")
     for r in range(1, args.runs + 1):
-        res = run_once(args.pattern, args.concurrency, args.hold, args.init_stock, args.observe)
+        res = run_once(
+            args.pattern, args.concurrency, args.hold,
+            args.duration, args.init_stock, args.observe,
+        )
         print(
-            f"{r:>4}  {res['tps']:>8.2f} {res['p50_ms']:>8.1f} "
+            f"{r:>4}  {res['tps']:>8.2f} "
             f"{res['p99_ms']:>9.1f} {res['count']:>6} {res['elapsed_s']:>10.3f}"
         )
 

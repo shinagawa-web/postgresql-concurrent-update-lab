@@ -9,19 +9,20 @@ run() {
   docker compose run --rm throughput-runner "$@"
 }
 
-# Round 1: hold time sweep, concurrency fixed at 20
-# Theoretical ceiling: TPS = 1/hold
-for hold in 0.01 0.1 1.0 5.0; do
-  run --pattern for_update --concurrency 20 --hold "$hold" --init-stock 500 --runs 2
+# Round 1: hold time sweep, concurrency fixed at 20, 30s steady-state window
+# Theoretical ceiling: TPS = 1/hold. Emerges from system behavior, not thread × hold math.
+for hold in 0.1 1.0 5.0; do
+  run --pattern for_update --concurrency 20 --hold "$hold" --duration 30 --init-stock 1000 --runs 2
 done
 
-# Round 2: concurrency sweep at hold=0.1 — ceiling should not move
+# Round 2: concurrency sweep at hold=0.1 — ceiling should not move as concurrency grows
 for conc in 1 5 10 20 50; do
-  run --pattern for_update --concurrency "$conc" --hold 0.1 --init-stock 500 --runs 2 --observe
+  run --pattern for_update --concurrency "$conc" --hold 0.1 --duration 30 --init-stock 1000 --runs 2 --observe
 done
 
-# Round 3: pattern comparison at concurrency=20
-run --pattern for_update  --concurrency 20 --hold 0.1 --init-stock 500 --runs 3
-run --pattern conditional --concurrency 20             --init-stock 500 --runs 3
+# Round 3: pattern comparison at concurrency=20, 30s window
+# conditional needs large stock: 200+ TPS × 30s = 6000+ commits
+run --pattern for_update  --concurrency 20 --hold 0.1 --duration 30 --init-stock 1000  --runs 2
+run --pattern conditional --concurrency 20             --duration 30 --init-stock 10000 --runs 2
 
 docker compose down
