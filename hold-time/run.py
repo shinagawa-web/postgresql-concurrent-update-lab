@@ -141,13 +141,14 @@ def run_once(pattern, concurrency, hold_sec, duration_sec, init_stock, observe=F
     elapsed = time.monotonic() - t_start
 
     if not latencies:
-        return {"tps": 0.0, "p99_ms": 0.0, "elapsed_s": elapsed, "count": 0}
+        return {"tps": 0.0, "p50_ms": 0.0, "p99_ms": 0.0, "elapsed_s": elapsed, "count": 0}
 
     latencies.sort()
     n = len(latencies)
+    p50 = latencies[min(int(n * 0.50), n - 1)] * 1000
     p99 = latencies[min(int(n * 0.99), n - 1)] * 1000
     tps = n / elapsed
-    return {"tps": tps, "p99_ms": p99, "elapsed_s": elapsed, "count": n}
+    return {"tps": tps, "p50_ms": p50, "p99_ms": p99, "elapsed_s": elapsed, "count": n}
 
 
 def main():
@@ -165,7 +166,7 @@ def main():
         f"pattern={args.pattern} concurrency={args.concurrency} "
         f"hold={args.hold}s duration={args.duration}s init_stock={args.init_stock}"
     )
-    print(f"{'run':>4}  {'tps':>8} {'p99_ms':>9} {'count':>6} {'elapsed_s':>10}")
+    print(f"{'run':>4}  {'tps':>8} {'p50_ms':>9} {'p99_ms':>9} {'count':>6} {'elapsed_s':>10}")
     for r in range(1, args.runs + 1):
         res = run_once(
             args.pattern, args.concurrency, args.hold,
@@ -173,7 +174,7 @@ def main():
         )
         print(
             f"{r:>4}  {res['tps']:>8.2f} "
-            f"{res['p99_ms']:>9.1f} {res['count']:>6} {res['elapsed_s']:>10.3f}"
+            f"{res['p50_ms']:>9.1f} {res['p99_ms']:>9.1f} {res['count']:>6} {res['elapsed_s']:>10.3f}"
         )
 
 
