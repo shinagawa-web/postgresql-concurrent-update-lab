@@ -1,0 +1,16 @@
+name: lost-update
+
+on:
+  pull_request:
+    paths:
+      - 'lost-update/**'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.github/workflows/lost-update.yml'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: chmod +x lost-update/run_all.sh && ./lost-update/run_all.sh

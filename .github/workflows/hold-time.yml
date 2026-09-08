@@ -1,0 +1,16 @@
+name: hold-time
+
+on:
+  pull_request:
+    paths:
+      - 'hold-time/**'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.github/workflows/throughput.yml'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: chmod +x hold-time/run_all.sh && ./hold-time/run_all.sh
