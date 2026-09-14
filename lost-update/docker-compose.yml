@@ -14,7 +14,7 @@ services:
       retries: 10
 
   runner:
-    build: ./lost-update
+    build: .
     environment:
       PGHOST: postgres
       PGPORT: 5432
@@ -26,17 +26,3 @@ services:
         condition: service_healthy
     profiles:
       - run
-
-  throughput-runner:
-    build: ./hold-time
-    environment:
-      PGHOST: postgres
-      PGPORT: 5432
-      PGDATABASE: lab
-      PGUSER: postgres
-      PGPASSWORD: test
-    depends_on:
-      postgres:
-        condition: service_healthy
-    profiles:
-      - throughput

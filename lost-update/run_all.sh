@@ -1,8 +1,9 @@
 #!/bin/sh
 set -e
+cd "$(dirname "$0")"
 
 docker compose up -d --wait
-docker compose exec -T postgres psql -U postgres -d lab -f /dev/stdin < lost-update/schema.sql
+docker compose exec -T postgres psql -U postgres -d lab -f /dev/stdin < schema.sql
 
 run() {
   echo "=== $* ==="

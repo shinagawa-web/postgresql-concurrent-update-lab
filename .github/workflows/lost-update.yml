@@ -4,8 +4,6 @@ on:
   pull_request:
     paths:
       - 'lost-update/**'
-      - 'Dockerfile'
-      - 'docker-compose.yml'
       - '.github/workflows/lost-update.yml'
 
 jobs:

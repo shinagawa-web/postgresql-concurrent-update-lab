@@ -4,9 +4,7 @@ on:
   pull_request:
     paths:
       - 'hold-time/**'
-      - 'Dockerfile'
-      - 'docker-compose.yml'
-      - '.github/workflows/throughput.yml'
+      - '.github/workflows/hold-time.yml'
 
 jobs:
   run:
