@@ -14,7 +14,7 @@ services:
       retries: 10
 
   runner:
-    build: .
+    build: ./lost-update
     environment:
       PGHOST: postgres
       PGPORT: 5432
@@ -28,8 +28,7 @@ services:
       - run
 
   throughput-runner:
-    build: .
-    entrypoint: ["python3", "/app/hold-time/run.py"]
+    build: ./hold-time
     environment:
       PGHOST: postgres
       PGPORT: 5432
