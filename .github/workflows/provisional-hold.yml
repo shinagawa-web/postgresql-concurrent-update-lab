@@ -1,0 +1,14 @@
+name: provisional-hold
+
+on:
+  pull_request:
+    paths:
+      - 'provisional-hold/**'
+      - '.github/workflows/provisional-hold.yml'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: chmod +x provisional-hold/run_all.sh && ./provisional-hold/run_all.sh
