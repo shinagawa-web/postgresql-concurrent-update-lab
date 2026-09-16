@@ -11,7 +11,8 @@ CREATE TABLE holds (
   product_id BIGINT NOT NULL REFERENCES inventory,
   user_id    BIGINT NOT NULL,
   quantity   INT NOT NULL,
-  status     TEXT NOT NULL CHECK (status IN ('reserved', 'paying', 'confirmed', 'expired')),
+  status     TEXT NOT NULL DEFAULT 'reserved'
+               CHECK (status IN ('reserved', 'paying', 'confirmed', 'expired')),
   expires_at TIMESTAMPTZ NOT NULL
 );
 
