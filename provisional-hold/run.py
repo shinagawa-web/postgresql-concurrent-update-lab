@@ -61,26 +61,26 @@ def _worker(stop, abandon_rate, timer_sec, purchase_sec):
             hold_id = None
             try:
                 with conn.cursor() as cur:
-                    cur.execute("BEGIN")
                     cur.execute(
-                        "UPDATE inventory SET stock = stock - 1"
-                        " WHERE product_id = 1 AND stock >= 1"
-                    )
-                    if cur.rowcount == 0:
-                        conn.commit()
-                        with _lock:
-                            _rejected += 1
-                        time.sleep(0.05)
-                        continue
-                    cur.execute(
-                        "INSERT INTO holds (product_id, user_id, quantity, status, expires_at)"
-                        " VALUES (1, %s, 1, 'reserved',"
-                        " NOW() + make_interval(secs => %s))"
+                        "WITH dec AS ("
+                        "  UPDATE inventory SET stock = stock - 1"
+                        "   WHERE product_id = 1 AND stock >= 1"
+                        "  RETURNING product_id"
+                        ")"
+                        "INSERT INTO holds (product_id, user_id, quantity, expires_at)"
+                        " SELECT product_id, %s, 1,"
+                        "  NOW() + make_interval(secs => %s) FROM dec"
                         " RETURNING hold_id",
                         (threading.get_ident() % 10**9, timer_sec),
                     )
-                    hold_id = cur.fetchone()[0]
+                    row = cur.fetchone()
                     conn.commit()
+                if row is None:
+                    with _lock:
+                        _rejected += 1
+                    time.sleep(0.05)
+                    continue
+                hold_id = row[0]
             except Exception:
                 try:
                     conn.rollback()
@@ -130,33 +130,26 @@ def _sweeper(stop):
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT hold_id, product_id, quantity FROM holds"
-                        " WHERE status = 'reserved' AND expires_at <= NOW()"
-                        " FOR UPDATE SKIP LOCKED"
+                        "WITH expired AS ("
+                        "  UPDATE holds SET status = 'expired'"
+                        "   WHERE status = 'reserved' AND expires_at <= NOW()"
+                        "  RETURNING hold_id, product_id, quantity"
+                        "),"
+                        "inv_update AS ("
+                        "  UPDATE inventory i SET stock = i.stock + e.total"
+                        "    FROM (SELECT product_id, SUM(quantity) AS total"
+                        "          FROM expired GROUP BY product_id) e"
+                        "    WHERE i.product_id = e.product_id"
+                        ")"
+                        "SELECT hold_id FROM expired"
                     )
                     rows = cur.fetchall()
-                    if not rows:
-                        conn.commit()
-                        continue
-                    hold_ids = [r[0] for r in rows]
-                    pid_qty: dict = {}
-                    for _, pid, qty in rows:
-                        pid_qty[pid] = pid_qty.get(pid, 0) + qty
-                    for pid, qty in pid_qty.items():
-                        cur.execute(
-                            "UPDATE inventory SET stock = stock + %s"
-                            " WHERE product_id = %s",
-                            (qty, pid),
-                        )
-                    cur.execute(
-                        "UPDATE holds SET status = 'expired'"
-                        " WHERE hold_id = ANY(%s)",
-                        (hold_ids,),
-                    )
                     conn.commit()
-                with _lock:
-                    _released += len(hold_ids)
-                    _abandoned_ids.difference_update(hold_ids)
+                if rows:
+                    hold_ids = [r[0] for r in rows]
+                    with _lock:
+                        _released += len(hold_ids)
+                        _abandoned_ids.difference_update(hold_ids)
             except Exception:
                 try:
                     conn.rollback()
