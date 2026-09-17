@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-Measure dead-inventory ratio under provisional-hold design.
+Finite-cohort simulation: N customers arrive via Poisson process over a window,
+competing for finite stock. All T values run in parallel (one product_id per T).
 
-Two formulas under test:
-  exact  = R*T / ((1-R)*P + R*T)   Little's Law
-  approx = R*T / P                  issue #347 approximation
-
-Time is scaled: 1s here = 1min real (ratio identical, runs in seconds not hours).
+1s here = 1min real (same scaling as previous steady-state script).
 """
 import argparse
 import math
@@ -25,30 +22,6 @@ DSN = (
     f"password={os.getenv('PGPASSWORD', 'test')}"
 )
 
-_lock = threading.Lock()
-_confirmed = 0
-_rejected = 0
-_abandoned = 0
-_immediate_released = 0
-_payment_failed = 0
-_expired_during_checkout = 0
-_released = 0
-_lost_sale = 0
-_abandoned_ids: set = set()
-_dead_samples: list = []
-_total_samples: list = []
-
-
-def _reset():
-    global _confirmed, _rejected, _abandoned, _immediate_released, _payment_failed
-    global _expired_during_checkout, _released, _lost_sale
-    global _abandoned_ids, _dead_samples, _total_samples
-    _confirmed = _rejected = _abandoned = _immediate_released = _payment_failed = 0
-    _expired_during_checkout = _released = _lost_sale = 0
-    _abandoned_ids = set()
-    _dead_samples = []
-    _total_samples = []
-
 
 def _lognormal(p50, p95):
     mu = math.log(p50)
@@ -56,145 +29,32 @@ def _lognormal(p50, p95):
     return random.lognormvariate(mu, sigma)
 
 
-def init_db(stock):
+def init_db(stock, n_products):
     with psycopg.connect(DSN) as conn:
         with conn.cursor() as cur:
             cur.execute("TRUNCATE holds, inventory RESTART IDENTITY CASCADE")
-            cur.execute(
-                "INSERT INTO inventory (product_id, stock) VALUES (1, %s)", (stock,)
-            )
+            for pid in range(1, n_products + 1):
+                cur.execute(
+                    "INSERT INTO inventory (product_id, stock) VALUES (%s, %s)",
+                    (pid, stock),
+                )
         conn.commit()
 
 
-def _release_hold(conn, hold_id, status_filter):
-    with conn.cursor() as cur:
-        cur.execute(
-            "WITH cancelled AS ("
-            "  UPDATE holds SET status = 'expired'"
-            "   WHERE hold_id = %s AND status = %s"
-            "  RETURNING product_id, quantity"
-            ")"
-            "UPDATE inventory i SET stock = i.stock + e.quantity"
-            "  FROM cancelled e WHERE i.product_id = e.product_id",
-            (hold_id, status_filter),
-        )
-        conn.commit()
+class _Scenario:
+    def __init__(self, product_id, T):
+        self.product_id = product_id
+        self.T = T
+        self.lock = threading.Lock()
+        self.confirmed = 0
+        self.expired_during_checkout = 0
+        self.lost_sale = 0
+        self.abandoned_ids = set()
 
 
-def _worker(stop, abandon_rate, immediate_release_rate, payment_fail_rate, timer_sec, purchase_sec, p95_sec):
-    global _confirmed, _rejected, _abandoned, _immediate_released
-    global _payment_failed, _expired_during_checkout, _lost_sale
-    with psycopg.connect(DSN) as conn:
-        while not stop.is_set():
-            hold_id = None
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "WITH dec AS ("
-                        "  UPDATE inventory SET stock = stock - 1"
-                        "   WHERE product_id = 1 AND stock >= 1"
-                        "  RETURNING product_id"
-                        ")"
-                        "INSERT INTO holds (product_id, user_id, quantity, expires_at)"
-                        " SELECT product_id, %s, 1,"
-                        "  NOW() + make_interval(secs => %s) FROM dec"
-                        " RETURNING hold_id",
-                        (threading.get_ident() % 10**9, timer_sec),
-                    )
-                    row = cur.fetchone()
-                    conn.commit()
-                if row is None:
-                    with _lock:
-                        _rejected += 1
-                        if _abandoned_ids:
-                            _lost_sale += 1
-                    time.sleep(0.05)
-                    continue
-                hold_id = row[0]
-            except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                continue
-
-            if random.random() < abandon_rate:
-                if random.random() < immediate_release_rate:
-                    try:
-                        _release_hold(conn, hold_id, 'reserved')
-                        with _lock:
-                            _immediate_released += 1
-                    except Exception:
-                        try:
-                            conn.rollback()
-                        except Exception:
-                            pass
-                        with _lock:
-                            _abandoned += 1
-                            _abandoned_ids.add(hold_id)
-                else:
-                    with _lock:
-                        _abandoned += 1
-                        _abandoned_ids.add(hold_id)
-                continue
-
-            time.sleep(_lognormal(purchase_sec, p95_sec))
-
-            if stop.is_set():
-                break
-
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE holds SET status = 'paying', paying_at = NOW()"
-                        " WHERE hold_id = %s"
-                        "   AND status = 'reserved'"
-                        "   AND expires_at > NOW()",
-                        (hold_id,),
-                    )
-                    if cur.rowcount == 0:
-                        conn.commit()
-                        with _lock:
-                            _expired_during_checkout += 1
-                        continue
-                    conn.commit()
-            except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                continue
-
-            if random.random() < payment_fail_rate:
-                try:
-                    _release_hold(conn, hold_id, 'paying')
-                    with _lock:
-                        _payment_failed += 1
-                except Exception:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-            else:
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "UPDATE holds SET status = 'confirmed'"
-                            " WHERE hold_id = %s AND status = 'paying'",
-                            (hold_id,),
-                        )
-                        conn.commit()
-                    with _lock:
-                        _confirmed += 1
-                except Exception:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-
-
-def _sweeper(stop):
-    global _released
+def _sweeper(stop, scenarios):
+    product_ids = [sc.product_id for sc in scenarios]
+    by_pid = {sc.product_id: sc for sc in scenarios}
     with psycopg.connect(DSN) as conn:
         while not stop.wait(0.5):
             try:
@@ -202,24 +62,26 @@ def _sweeper(stop):
                     cur.execute(
                         "WITH expired AS ("
                         "  UPDATE holds SET status = 'expired'"
-                        "   WHERE status = 'reserved' AND expires_at <= NOW()"
+                        "   WHERE product_id = ANY(%s) AND status = 'reserved'"
+                        "     AND expires_at <= NOW()"
                         "  RETURNING hold_id, product_id, quantity"
-                        "),"
-                        "inv_update AS ("
-                        "  UPDATE inventory i SET stock = i.stock + e.total"
+                        "), inv_update AS ("
+                        "  UPDATE inventory i"
+                        "    SET stock = i.stock + e.total"
                         "    FROM (SELECT product_id, SUM(quantity) AS total"
                         "          FROM expired GROUP BY product_id) e"
                         "    WHERE i.product_id = e.product_id"
                         ")"
-                        "SELECT hold_id FROM expired"
+                        "SELECT hold_id, product_id FROM expired",
+                        (product_ids,),
                     )
                     rows = cur.fetchall()
-                    conn.commit()
+                conn.commit()
                 if rows:
-                    hold_ids = [r[0] for r in rows]
-                    with _lock:
-                        _released += len(hold_ids)
-                        _abandoned_ids.difference_update(hold_ids)
+                    for hold_id, pid in rows:
+                        sc = by_pid[pid]
+                        with sc.lock:
+                            sc.abandoned_ids.discard(hold_id)
             except Exception:
                 try:
                     conn.rollback()
@@ -227,129 +89,157 @@ def _sweeper(stop):
                     pass
 
 
-def _observer(stop):
-    with psycopg.connect(DSN) as conn:
-        conn.autocommit = True
-        while not stop.wait(0.5):
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT COUNT(*) FROM holds WHERE status = 'reserved'"
-                    )
-                    total = cur.fetchone()[0]
-                with _lock:
-                    dead = len(_abandoned_ids)
-                _dead_samples.append(dead)
-                _total_samples.append(total)
-                print(f"  reserved={total} dead={dead}", flush=True)
-            except Exception:
-                pass
+def _customer(sc, abandon_rate, purchase_sec, p95_sec):
+    try:
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "WITH dec AS ("
+                    "  UPDATE inventory SET stock = stock - 1"
+                    "   WHERE product_id = %s AND stock >= 1"
+                    "  RETURNING product_id"
+                    ")"
+                    "INSERT INTO holds (product_id, user_id, quantity, expires_at)"
+                    " SELECT product_id, %s, 1,"
+                    "  NOW() + make_interval(secs => %s) FROM dec"
+                    " RETURNING hold_id",
+                    (sc.product_id, threading.get_ident() % 10**9, sc.T),
+                )
+                row = cur.fetchone()
+            conn.commit()
+    except Exception:
+        return
+
+    if row is None:
+        with sc.lock:
+            if sc.abandoned_ids:
+                sc.lost_sale += 1
+        return
+
+    hold_id = row[0]
+
+    if random.random() < abandon_rate:
+        with sc.lock:
+            sc.abandoned_ids.add(hold_id)
+        return
+
+    time.sleep(_lognormal(purchase_sec, p95_sec))
+
+    try:
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE holds SET status = 'paying', paying_at = NOW()"
+                    " WHERE hold_id = %s AND status = 'reserved' AND expires_at > NOW()",
+                    (hold_id,),
+                )
+                expired = cur.rowcount == 0
+            conn.commit()
+    except Exception:
+        return
+
+    if expired:
+        with sc.lock:
+            sc.expired_during_checkout += 1
+        return
+
+    try:
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE holds SET status = 'confirmed'"
+                    " WHERE hold_id = %s AND status = 'paying'",
+                    (hold_id,),
+                )
+            conn.commit()
+        with sc.lock:
+            sc.confirmed += 1
+    except Exception:
+        pass
 
 
-def run_once(abandon_rate, immediate_release_rate, payment_fail_rate,
-             timer_sec, purchase_sec, p95_sec, concurrency, duration_sec, init_stock):
-    _reset()
-    init_db(init_stock)
-
-    stop = threading.Event()
-    threads = [
-        threading.Thread(
-            target=_worker,
-            args=(stop, abandon_rate, immediate_release_rate, payment_fail_rate,
-                  timer_sec, purchase_sec, p95_sec),
+def _arrival_generator(sc, abandon_rate, purchase_sec, p95_sec, n_customers, arrival_rate):
+    threads = []
+    for _ in range(n_customers):
+        time.sleep(random.expovariate(arrival_rate))
+        t = threading.Thread(
+            target=_customer,
+            args=(sc, abandon_rate, purchase_sec, p95_sec),
+            daemon=True,
         )
-        for _ in range(concurrency)
-    ]
-    threading.Thread(target=_sweeper, args=(stop,), daemon=True).start()
-    threading.Thread(target=_observer, args=(stop,), daemon=True).start()
-
-    t0 = time.monotonic()
-    for t in threads:
         t.start()
-    time.sleep(duration_sec)
-    stop.set()
+        threads.append(t)
     for t in threads:
         t.join()
-    elapsed = time.monotonic() - t0
 
-    mean_dead = sum(_dead_samples) / len(_dead_samples) if _dead_samples else 0.0
-    mean_total = sum(_total_samples) / len(_total_samples) if _total_samples else 0.0
-    measured = mean_dead / mean_total if mean_total > 0 else 0.0
-    eff_R = abandon_rate * (1 - immediate_release_rate)
-    mu = math.log(purchase_sec)
-    sigma = (math.log(p95_sec) - mu) / 1.645
-    purchase_mean = math.exp(mu + sigma ** 2 / 2)
-    pred_exact = (eff_R * timer_sec) / (
-        (1 - eff_R) * purchase_mean + eff_R * timer_sec
-    )
-    pred_approx = eff_R * timer_sec / purchase_mean
+
+def run_round(T_values, abandon_rate, purchase_sec, p95_sec, n_customers, arrival_rate, stock):
+    scenarios = [_Scenario(i + 1, T) for i, T in enumerate(T_values)]
+    init_db(stock, len(scenarios))
+
+    stop = threading.Event()
+    threading.Thread(target=_sweeper, args=(stop, scenarios), daemon=True).start()
+
+    gen_threads = [
+        threading.Thread(
+            target=_arrival_generator,
+            args=(sc, abandon_rate, purchase_sec, p95_sec, n_customers, arrival_rate),
+        )
+        for sc in scenarios
+    ]
+    for t in gen_threads:
+        t.start()
+    for t in gen_threads:
+        t.join()
+
+    stop.set()
 
     return {
-        "confirmed": _confirmed,
-        "rejected": _rejected,
-        "abandoned": _abandoned,
-        "immediate_released": _immediate_released,
-        "payment_failed": _payment_failed,
-        "expired_during_checkout": _expired_during_checkout,
-        "released": _released,
-        "lost_sale": _lost_sale,
-        "mean_dead": mean_dead,
-        "mean_total": mean_total,
-        "measured": measured,
-        "pred_exact": pred_exact,
-        "pred_approx": pred_approx,
-        "elapsed_s": elapsed,
+        sc.T: {
+            "confirmed": sc.confirmed,
+            "expired_during_checkout": sc.expired_during_checkout,
+            "lost_sale": sc.lost_sale,
+        }
+        for sc in scenarios
     }
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--abandon-rate", type=float, required=True)
-    p.add_argument("--immediate-release-rate", type=float, default=0.0,
-                   help="fraction of abandons that explicitly delete from cart (default: 0)")
-    p.add_argument("--payment-fail-rate", type=float, default=0.0,
-                   help="fraction of payments that fail (default: 0)")
-    p.add_argument("--timer", type=float, required=True, help="hold expiry seconds (1s = 1min scaled)")
-    p.add_argument("--purchase", type=float, default=2.0, help="p50 (median) checkout seconds")
+    p.add_argument("--abandon-rate", type=float, default=0.5)
+    p.add_argument("--purchase", type=float, default=2.0, help="p50 checkout seconds (1s = 1min)")
     p.add_argument("--p95", type=float, default=None, help="p95 checkout seconds (default: 3x --purchase)")
-    p.add_argument("--concurrency", type=int, default=20)
-    p.add_argument("--duration", type=int, default=30)
-    p.add_argument("--init-stock", type=int, default=100000)
+    p.add_argument("--customers", type=int, default=300)
+    p.add_argument("--window", type=float, default=30.0, help="arrival window seconds")
+    p.add_argument("--stock", type=int, default=100)
     p.add_argument("--runs", type=int, default=1)
+    p.add_argument("--timers", type=str, default="1,2,3,5,7,10,15,20")
     args = p.parse_args()
 
-    R, I, F, T, P = (
-        args.abandon_rate, args.immediate_release_rate, args.payment_fail_rate,
-        args.timer, args.purchase,
-    )
-    P95 = args.p95 if args.p95 is not None else P * 3
-    eff_R = R * (1 - I)
-    mu = math.log(P)
-    sigma = (math.log(P95) - mu) / 1.645
-    purchase_mean = math.exp(mu + sigma ** 2 / 2)
-    pred_exact = eff_R * T / ((1 - eff_R) * purchase_mean + eff_R * T)
-    pred_approx = eff_R * T / purchase_mean
+    P95 = args.p95 if args.p95 is not None else args.purchase * 3
+    arrival_rate = args.customers / args.window
+    T_values = [float(t) for t in args.timers.split(",")]
+    R = args.abandon_rate
 
     print(
-        f"abandon_rate={R} immediate_release_rate={I} payment_fail_rate={F}"
-        f" timer={T}s purchase_p50={P}s purchase_p95={P95}s"
-        f" concurrency={args.concurrency} duration={args.duration}s"
+        f"customers={args.customers} window={args.window}s stock={args.stock}"
+        f" abandon_rate={R} p50={args.purchase}s p95={P95}s runs={args.runs}"
     )
-    print(f"pred_exact={pred_exact:.3f}  pred_approx={pred_approx:.3f}")
-    print(
-        f"{'run':>4}  {'confirmed':>10} {'rejected':>9} {'abandoned':>10}"
-        f" {'imm_rel':>8} {'pay_fail':>9} {'exp_co':>7} {'released':>8}"
-        f" {'lost_sale':>10} {'mean_dead':>10} {'mean_total':>11} {'measured':>9}"
-    )
+    print(f"{'T(s)':>6}  {'confirmed':>10} {'exp_during_co':>14} {'lost_sale':>10}")
 
-    for r in range(1, args.runs + 1):
-        res = run_once(R, I, F, T, P, P95, args.concurrency, args.duration, args.init_stock)
+    totals = {T: {"confirmed": 0, "expired_during_checkout": 0, "lost_sale": 0} for T in T_values}
+    for _ in range(args.runs):
+        res = run_round(T_values, R, args.purchase, P95, args.customers, arrival_rate, args.stock)
+        for T in T_values:
+            for k in totals[T]:
+                totals[T][k] += res[T][k]
+
+    for T in T_values:
+        n = args.runs
         print(
-            f"{r:>4}  {res['confirmed']:>10} {res['rejected']:>9} {res['abandoned']:>10}"
-            f" {res['immediate_released']:>8} {res['payment_failed']:>9}"
-            f" {res['expired_during_checkout']:>7} {res['released']:>8}"
-            f" {res['lost_sale']:>10} {res['mean_dead']:>10.1f}"
-            f" {res['mean_total']:>11.1f} {res['measured']:>9.3f}"
+            f"{T:>6.0f}  {totals[T]['confirmed']/n:>10.1f}"
+            f" {totals[T]['expired_during_checkout']/n:>14.1f}"
+            f" {totals[T]['lost_sale']/n:>10.1f}"
         )
 
 
