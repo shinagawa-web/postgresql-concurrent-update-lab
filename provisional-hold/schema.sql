@@ -13,7 +13,9 @@ CREATE TABLE holds (
   quantity   INT NOT NULL CHECK (quantity > 0),
   status     TEXT NOT NULL DEFAULT 'reserved'
                CHECK (status IN ('reserved', 'paying', 'confirmed', 'expired')),
-  expires_at TIMESTAMPTZ NOT NULL
+  expires_at TIMESTAMPTZ NOT NULL,
+  paying_at  TIMESTAMPTZ
 );
 
 CREATE INDEX ON holds (expires_at) WHERE status = 'reserved';
+CREATE INDEX ON holds (paying_at)  WHERE status = 'paying';

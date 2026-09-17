@@ -9,6 +9,7 @@ Two formulas under test:
 Time is scaled: 1s here = 1min real (ratio identical, runs in seconds not hours).
 """
 import argparse
+import math
 import os
 import random
 import threading
@@ -32,6 +33,7 @@ _immediate_released = 0
 _payment_failed = 0
 _expired_during_checkout = 0
 _released = 0
+_lost_sale = 0
 _abandoned_ids: set = set()
 _dead_samples: list = []
 _total_samples: list = []
@@ -39,13 +41,19 @@ _total_samples: list = []
 
 def _reset():
     global _confirmed, _rejected, _abandoned, _immediate_released, _payment_failed
-    global _expired_during_checkout, _released
+    global _expired_during_checkout, _released, _lost_sale
     global _abandoned_ids, _dead_samples, _total_samples
     _confirmed = _rejected = _abandoned = _immediate_released = _payment_failed = 0
-    _expired_during_checkout = _released = 0
+    _expired_during_checkout = _released = _lost_sale = 0
     _abandoned_ids = set()
     _dead_samples = []
     _total_samples = []
+
+
+def _lognormal(p50, p95):
+    mu = math.log(p50)
+    sigma = (math.log(p95) - mu) / 1.645
+    return random.lognormvariate(mu, sigma)
 
 
 def init_db(stock):
@@ -73,9 +81,9 @@ def _release_hold(conn, hold_id, status_filter):
         conn.commit()
 
 
-def _worker(stop, abandon_rate, immediate_release_rate, payment_fail_rate, timer_sec, purchase_sec):
+def _worker(stop, abandon_rate, immediate_release_rate, payment_fail_rate, timer_sec, purchase_sec, p95_sec):
     global _confirmed, _rejected, _abandoned, _immediate_released
-    global _payment_failed, _expired_during_checkout
+    global _payment_failed, _expired_during_checkout, _lost_sale
     with psycopg.connect(DSN) as conn:
         while not stop.is_set():
             hold_id = None
@@ -98,6 +106,8 @@ def _worker(stop, abandon_rate, immediate_release_rate, payment_fail_rate, timer
                 if row is None:
                     with _lock:
                         _rejected += 1
+                        if _abandoned_ids:
+                            _lost_sale += 1
                     time.sleep(0.05)
                     continue
                 hold_id = row[0]
@@ -128,7 +138,7 @@ def _worker(stop, abandon_rate, immediate_release_rate, payment_fail_rate, timer
                         _abandoned_ids.add(hold_id)
                 continue
 
-            time.sleep(purchase_sec * (0.5 + random.random()))
+            time.sleep(_lognormal(purchase_sec, p95_sec))
 
             if stop.is_set():
                 break
@@ -136,7 +146,7 @@ def _worker(stop, abandon_rate, immediate_release_rate, payment_fail_rate, timer
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE holds SET status = 'paying'"
+                        "UPDATE holds SET status = 'paying', paying_at = NOW()"
                         " WHERE hold_id = %s"
                         "   AND status = 'reserved'"
                         "   AND expires_at > NOW()",
@@ -237,7 +247,7 @@ def _observer(stop):
 
 
 def run_once(abandon_rate, immediate_release_rate, payment_fail_rate,
-             timer_sec, purchase_sec, concurrency, duration_sec, init_stock):
+             timer_sec, purchase_sec, p95_sec, concurrency, duration_sec, init_stock):
     _reset()
     init_db(init_stock)
 
@@ -246,7 +256,7 @@ def run_once(abandon_rate, immediate_release_rate, payment_fail_rate,
         threading.Thread(
             target=_worker,
             args=(stop, abandon_rate, immediate_release_rate, payment_fail_rate,
-                  timer_sec, purchase_sec),
+                  timer_sec, purchase_sec, p95_sec),
         )
         for _ in range(concurrency)
     ]
@@ -266,10 +276,13 @@ def run_once(abandon_rate, immediate_release_rate, payment_fail_rate,
     mean_total = sum(_total_samples) / len(_total_samples) if _total_samples else 0.0
     measured = mean_dead / mean_total if mean_total > 0 else 0.0
     eff_R = abandon_rate * (1 - immediate_release_rate)
+    mu = math.log(purchase_sec)
+    sigma = (math.log(p95_sec) - mu) / 1.645
+    purchase_mean = math.exp(mu + sigma ** 2 / 2)
     pred_exact = (eff_R * timer_sec) / (
-        (1 - eff_R) * purchase_sec + eff_R * timer_sec
+        (1 - eff_R) * purchase_mean + eff_R * timer_sec
     )
-    pred_approx = eff_R * timer_sec / purchase_sec
+    pred_approx = eff_R * timer_sec / purchase_mean
 
     return {
         "confirmed": _confirmed,
@@ -279,6 +292,7 @@ def run_once(abandon_rate, immediate_release_rate, payment_fail_rate,
         "payment_failed": _payment_failed,
         "expired_during_checkout": _expired_during_checkout,
         "released": _released,
+        "lost_sale": _lost_sale,
         "mean_dead": mean_dead,
         "mean_total": mean_total,
         "measured": measured,
@@ -296,7 +310,8 @@ def main():
     p.add_argument("--payment-fail-rate", type=float, default=0.0,
                    help="fraction of payments that fail (default: 0)")
     p.add_argument("--timer", type=float, required=True, help="hold expiry seconds (1s = 1min scaled)")
-    p.add_argument("--purchase", type=float, default=2.0, help="mean checkout seconds")
+    p.add_argument("--purchase", type=float, default=2.0, help="p50 (median) checkout seconds")
+    p.add_argument("--p95", type=float, default=None, help="p95 checkout seconds (default: 3x --purchase)")
     p.add_argument("--concurrency", type=int, default=20)
     p.add_argument("--duration", type=int, default=30)
     p.add_argument("--init-stock", type=int, default=100000)
@@ -307,29 +322,34 @@ def main():
         args.abandon_rate, args.immediate_release_rate, args.payment_fail_rate,
         args.timer, args.purchase,
     )
+    P95 = args.p95 if args.p95 is not None else P * 3
     eff_R = R * (1 - I)
-    pred_exact = eff_R * T / ((1 - eff_R) * P + eff_R * T)
-    pred_approx = eff_R * T / P
+    mu = math.log(P)
+    sigma = (math.log(P95) - mu) / 1.645
+    purchase_mean = math.exp(mu + sigma ** 2 / 2)
+    pred_exact = eff_R * T / ((1 - eff_R) * purchase_mean + eff_R * T)
+    pred_approx = eff_R * T / purchase_mean
 
     print(
         f"abandon_rate={R} immediate_release_rate={I} payment_fail_rate={F}"
-        f" timer={T}s purchase={P}s"
+        f" timer={T}s purchase_p50={P}s purchase_p95={P95}s"
         f" concurrency={args.concurrency} duration={args.duration}s"
     )
     print(f"pred_exact={pred_exact:.3f}  pred_approx={pred_approx:.3f}")
     print(
         f"{'run':>4}  {'confirmed':>10} {'rejected':>9} {'abandoned':>10}"
-        f" {'imm_rel':>8} {'pay_fail':>9} {'exp_co':>7} {'sweeper':>8}"
-        f" {'mean_dead':>10} {'mean_total':>11} {'measured':>9}"
+        f" {'imm_rel':>8} {'pay_fail':>9} {'exp_co':>7} {'released':>8}"
+        f" {'lost_sale':>10} {'mean_dead':>10} {'mean_total':>11} {'measured':>9}"
     )
 
     for r in range(1, args.runs + 1):
-        res = run_once(R, I, F, T, P, args.concurrency, args.duration, args.init_stock)
+        res = run_once(R, I, F, T, P, P95, args.concurrency, args.duration, args.init_stock)
         print(
             f"{r:>4}  {res['confirmed']:>10} {res['rejected']:>9} {res['abandoned']:>10}"
             f" {res['immediate_released']:>8} {res['payment_failed']:>9}"
             f" {res['expired_during_checkout']:>7} {res['released']:>8}"
-            f" {res['mean_dead']:>10.1f} {res['mean_total']:>11.1f} {res['measured']:>9.3f}"
+            f" {res['lost_sale']:>10} {res['mean_dead']:>10.1f}"
+            f" {res['mean_total']:>11.1f} {res['measured']:>9.3f}"
         )
 
 
