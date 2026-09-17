@@ -10,14 +10,12 @@ run() {
   docker compose run --rm runner "$@"
 }
 
-# Reduced grid for CI speed during development.
-# Full 9-case grid (timer 1/5/10 x abandon 0.2/0.5/0.7, duration=40, runs=2)
-# will be restored before final merge — see PR TODO.
-for args in \
-  "--abandon-rate 0.2 --timer 1" \
-  "--abandon-rate 0.5 --timer 5" \
-  "--abandon-rate 0.7 --timer 10"; do
-  run $args --purchase 2 --concurrency 20 --duration 15 --init-stock 100000 --runs 1
+for abandon_rate in 0.2 0.5 0.7; do
+  run --abandon-rate "$abandon_rate" \
+      --purchase 2 --p95 6 \
+      --customers 300 --window 30 --stock 100 \
+      --timers 1,3,5,10 \
+      --runs 1
 done
 
 docker compose down
