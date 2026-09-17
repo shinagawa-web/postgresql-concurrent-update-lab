@@ -90,6 +90,8 @@ def _sweeper(stop, scenarios):
 
 
 def _customer(sc, abandon_rate, purchase_sec, p95_sec):
+    is_buyer = random.random() >= abandon_rate
+
     try:
         with psycopg.connect(DSN) as conn:
             with conn.cursor() as cur:
@@ -111,14 +113,15 @@ def _customer(sc, abandon_rate, purchase_sec, p95_sec):
         return
 
     if row is None:
-        with sc.lock:
-            if sc.abandoned_ids:
-                sc.lost_sale += 1
+        if is_buyer:
+            with sc.lock:
+                if sc.abandoned_ids:
+                    sc.lost_sale += 1
         return
 
     hold_id = row[0]
 
-    if random.random() < abandon_rate:
+    if not is_buyer:
         with sc.lock:
             sc.abandoned_ids.add(hold_id)
         return
