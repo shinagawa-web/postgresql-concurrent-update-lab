@@ -9,6 +9,7 @@ import argparse
 import math
 import os
 import random
+import statistics
 import threading
 import time
 
@@ -23,10 +24,10 @@ DSN = (
 )
 
 
-def _lognormal(p50, p95):
+def _lognormal(rng, p50, p95):
     mu = math.log(p50)
     sigma = (math.log(p95) - mu) / 1.645
-    return random.lognormvariate(mu, sigma)
+    return rng.lognormvariate(mu, sigma)
 
 
 def init_db(stock, n_products):
@@ -50,11 +51,13 @@ class _Scenario:
         self.expired_during_checkout = 0
         self.lost_sale = 0
         self.abandoned_ids = set()
+        self.dead_ratio_snapshots = []
 
 
-def _sweeper(stop, scenarios):
+def _sweeper(stop, scenarios, window):
     product_ids = [sc.product_id for sc in scenarios]
     by_pid = {sc.product_id: sc for sc in scenarios}
+    start = time.time()
     with psycopg.connect(DSN) as conn:
         while not stop.wait(0.5):
             try:
@@ -82,6 +85,21 @@ def _sweeper(stop, scenarios):
                         sc = by_pid[pid]
                         with sc.lock:
                             sc.abandoned_ids.discard(hold_id)
+                if time.time() - start < window:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT product_id, COUNT(*) FROM holds"
+                            " WHERE product_id = ANY(%s) AND status = 'reserved'"
+                            " GROUP BY product_id",
+                            (product_ids,),
+                        )
+                        totals = dict(cur.fetchall())
+                    for sc in scenarios:
+                        total = totals.get(sc.product_id, 0)
+                        if total > 0:
+                            with sc.lock:
+                                dead = len(sc.abandoned_ids)
+                            sc.dead_ratio_snapshots.append(dead / total)
             except Exception:
                 try:
                     conn.rollback()
@@ -90,7 +108,8 @@ def _sweeper(stop, scenarios):
 
 
 def _customer(sc, abandon_rate, purchase_sec, p95_sec):
-    is_buyer = random.random() >= abandon_rate
+    rng = random.Random()
+    is_buyer = rng.random() >= abandon_rate
 
     try:
         with psycopg.connect(DSN) as conn:
@@ -126,7 +145,7 @@ def _customer(sc, abandon_rate, purchase_sec, p95_sec):
             sc.abandoned_ids.add(hold_id)
         return
 
-    time.sleep(_lognormal(purchase_sec, p95_sec))
+    time.sleep(_lognormal(rng, purchase_sec, p95_sec))
 
     try:
         with psycopg.connect(DSN) as conn:
@@ -162,9 +181,10 @@ def _customer(sc, abandon_rate, purchase_sec, p95_sec):
 
 
 def _arrival_generator(sc, abandon_rate, purchase_sec, p95_sec, n_customers, arrival_rate):
+    rng = random.Random()
     threads = []
     for _ in range(n_customers):
-        time.sleep(random.expovariate(arrival_rate))
+        time.sleep(rng.expovariate(arrival_rate))
         t = threading.Thread(
             target=_customer,
             args=(sc, abandon_rate, purchase_sec, p95_sec),
@@ -181,7 +201,8 @@ def run_round(T_values, abandon_rate, purchase_sec, p95_sec, n_customers, arriva
     init_db(stock, len(scenarios))
 
     stop = threading.Event()
-    threading.Thread(target=_sweeper, args=(stop, scenarios), daemon=True).start()
+    window_sec = n_customers / arrival_rate
+    threading.Thread(target=_sweeper, args=(stop, scenarios, window_sec), daemon=True).start()
 
     gen_threads = [
         threading.Thread(
@@ -202,6 +223,7 @@ def run_round(T_values, abandon_rate, purchase_sec, p95_sec, n_customers, arriva
             "confirmed": sc.confirmed,
             "expired_during_checkout": sc.expired_during_checkout,
             "lost_sale": sc.lost_sale,
+            "dead_ratio": statistics.mean(sc.dead_ratio_snapshots) if sc.dead_ratio_snapshots else 0.0,
         }
         for sc in scenarios
     }
@@ -209,13 +231,13 @@ def run_round(T_values, abandon_rate, purchase_sec, p95_sec, n_customers, arriva
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--abandon-rate", type=float, default=0.5)
+    p.add_argument("--abandon-rate", type=float, default=0.7)
     p.add_argument("--purchase", type=float, default=2.0, help="p50 checkout seconds (1s = 1min)")
     p.add_argument("--p95", type=float, default=None, help="p95 checkout seconds (default: 3x --purchase)")
     p.add_argument("--customers", type=int, default=300)
     p.add_argument("--window", type=float, default=30.0, help="arrival window seconds")
     p.add_argument("--stock", type=int, default=100)
-    p.add_argument("--runs", type=int, default=1)
+    p.add_argument("--runs", type=int, default=30)
     p.add_argument("--timers", type=str, default="1,2,3,5,7,10,15,20")
     args = p.parse_args()
 
@@ -228,9 +250,9 @@ def main():
         f"customers={args.customers} window={args.window}s stock={args.stock}"
         f" abandon_rate={R} p50={args.purchase}s p95={P95}s runs={args.runs}"
     )
-    print(f"{'T(s)':>6}  {'confirmed':>10} {'exp_during_co':>14} {'lost_sale':>10}")
+    print(f"{'T(s)':>6}  {'confirmed':>10} {'exp_during_co':>14} {'lost_sale':>10} {'dead_ratio':>10}")
 
-    totals = {T: {"confirmed": 0, "expired_during_checkout": 0, "lost_sale": 0} for T in T_values}
+    totals = {T: {"confirmed": 0, "expired_during_checkout": 0, "lost_sale": 0, "dead_ratio": 0.0} for T in T_values}
     for _ in range(args.runs):
         res = run_round(T_values, R, args.purchase, P95, args.customers, arrival_rate, args.stock)
         for T in T_values:
@@ -243,6 +265,7 @@ def main():
             f"{T:>6.0f}  {totals[T]['confirmed']/n:>10.1f}"
             f" {totals[T]['expired_during_checkout']/n:>14.1f}"
             f" {totals[T]['lost_sale']/n:>10.1f}"
+            f" {totals[T]['dead_ratio']/n:>10.3f}"
         )
 
 

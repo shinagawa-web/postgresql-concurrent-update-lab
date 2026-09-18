@@ -41,6 +41,7 @@ def simulate(stock, n_customers, window, abandon_rate, timer, sweep, purchase, p
     stock_left = stock
     holds = {}
     res = dict(confirmed=0, expired_during_checkout=0, lost_sale=0)
+    snapshots = []
     hid = 0
 
     while ev:
@@ -76,7 +77,13 @@ def simulate(stock, n_customers, window, abandon_rate, timer, sweep, purchase, p
                 if h["state"] == "reserved" and h["expires"] <= now:
                     h["state"] = "expired"
                     stock_left += 1
+            if now <= D:
+                reserved = [h for h in holds.values() if h["state"] == "reserved"]
+                if reserved:
+                    dead = sum(1 for h in reserved if h["abandoner"])
+                    snapshots.append(dead / len(reserved))
 
+    res["dead_ratio"] = statistics.mean(snapshots) if snapshots else 0.0
     return res
 
 
@@ -87,7 +94,7 @@ def main():
     p.add_argument("--window", type=float, default=30.0, help="arrival window (min)")
     p.add_argument("--purchase", type=float, default=2.0, help="p50 checkout (min)")
     p.add_argument("--p95", type=float, default=None, help="p95 checkout (min, default: 3x --purchase)")
-    p.add_argument("--abandon-rate", type=float, default=0.5)
+    p.add_argument("--abandon-rate", type=float, default=0.7)
     p.add_argument("--timers", type=str, default="1,2,3,5,7,10,15,20", help="comma-separated T values (min)")
     p.add_argument("--sweep", type=float, default=10 / 60, help="sweep interval (min, default: 10s)")
     p.add_argument("--remove-rate", type=float, default=0.0)
@@ -102,7 +109,7 @@ def main():
         f"customers={args.customers} window={args.window}min stock={args.stock}"
         f" abandon_rate={R} p50={args.purchase}min p95={P95}min runs={args.runs}"
     )
-    print(f"{'T(min)':>7}  {'confirmed':>10} {'exp_during_co':>14} {'lost_sale':>10}")
+    print(f"{'T(min)':>7}  {'confirmed':>10} {'exp_during_co':>14} {'lost_sale':>10} {'dead_ratio':>10}")
 
     for T in T_values:
         rs = [
@@ -115,6 +122,7 @@ def main():
             f"{T:>7.0f}  {m('confirmed'):>10.1f}"
             f" {m('expired_during_checkout'):>14.1f}"
             f" {m('lost_sale'):>10.1f}"
+            f" {m('dead_ratio'):>10.3f}"
         )
 
 
